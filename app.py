@@ -620,6 +620,7 @@ class AudioExtractorApp(BaseApp):
                 sys.executable, "-m", "yt_dlp",
                 "--no-check-certificates",
                 "--geo-bypass",
+                "--remote-components", "ejs:github",
                 "--extractor-args", "youtube:player_client=ios,android,mweb",
             ]
 

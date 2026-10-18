@@ -219,25 +219,57 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
     # Multi-strategy client definitions for YouTube (especially on Cloud / Render datacenter IPs)
     if is_youtube:
         strategies = [
-            # Strategy 1: Android API with player_skip (bypasses web HTML scraper & BotGuard PO-token challenge)
-            ["--extractor-args", "youtube:player_client=android;player_skip=webpage,configs"],
-            # Strategy 2: Android standard client
-            ["--extractor-args", "youtube:player_client=android"],
-            # Strategy 3: iOS app client
-            ["--extractor-args", "youtube:player_client=ios"],
-            # Strategy 4: TV Embedded client
-            ["--extractor-args", "youtube:player_client=tv_embedded"],
-            # Strategy 5: Mobile Web client
-            ["--extractor-args", "youtube:player_client=mweb"],
-            # Strategy 6: Web Embedded client
-            ["--extractor-args", "youtube:player_client=web_embedded"],
-            # Strategy 7: Web client with cookies
-            ["--extractor-args", "youtube:player_client=web"],
-            # Strategy 8: Default fallback
-            []
+            # Strategy 1: Remote EJS solver without cookies (Fastest, solves JS challenges via Node.js, immune to cookie expiry)
+            {
+                "name": "EJS Challenge Solver (Node.js)",
+                "args": ["--remote-components", "ejs:github"],
+                "use_cookies": False
+            },
+            # Strategy 2: Android API without cookies
+            {
+                "name": "Android API (cookieless)",
+                "args": ["--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=android;player_skip=webpage,configs"],
+                "use_cookies": False
+            },
+            # Strategy 3: TV Embedded without cookies
+            {
+                "name": "TV Embedded (cookieless)",
+                "args": ["--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=tv_embedded"],
+                "use_cookies": False
+            },
+            # Strategy 4: Web client WITH cookies + EJS (For age-restricted / private / member-only videos)
+            {
+                "name": "Web Session (with cookies)",
+                "args": ["--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=web"],
+                "use_cookies": True
+            },
+            # Strategy 5: Mobile Web WITH cookies + EJS
+            {
+                "name": "Mobile Web (with cookies)",
+                "args": ["--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=mweb"],
+                "use_cookies": True
+            },
+            # Strategy 6: iOS client without cookies
+            {
+                "name": "iOS API (cookieless)",
+                "args": ["--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=ios"],
+                "use_cookies": False
+            },
+            # Strategy 7: Fallback with cookies
+            {
+                "name": "Default Fallback",
+                "args": ["--remote-components", "ejs:github"],
+                "use_cookies": True
+            }
         ]
     else:
-        strategies = [[]]
+        strategies = [
+            {
+                "name": "Direct Media Extractor",
+                "args": [],
+                "use_cookies": True
+            }
+        ]
 
     # Video / Audio format flags
     if is_video:
@@ -275,7 +307,11 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
     success = False
     last_error_lines = []
 
-    for strat_idx, strat_args in enumerate(strategies):
+    for strat_idx, strat in enumerate(strategies):
+        strat_args = strat["args"]
+        use_cookies = strat["use_cookies"]
+        strat_name = strat["name"]
+
         cmd = [
             sys.executable, "-m", "yt_dlp",
             "-4",
@@ -284,7 +320,7 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
             "--socket-timeout", "30",
         ]
 
-        if found_cookie:
+        if found_cookie and use_cookies:
             cmd.extend(["--cookies", str(found_cookie.resolve())])
 
         if strat_args:
@@ -362,7 +398,8 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
             last_error_lines = error_lines
             # If failed and more strategies exist, retry with next resolver
             if strat_idx < len(strategies) - 1:
-                jobs[job_id]["message"] = f"Switching client stream resolver (attempt {strat_idx + 2} of {len(strategies)})..."
+                next_strat = strategies[strat_idx + 1]["name"]
+                jobs[job_id]["message"] = f"Switching resolver to {next_strat} (attempt {strat_idx + 2} of {len(strategies)})..."
                 time.sleep(0.5)
                 continue
 
@@ -477,7 +514,10 @@ def get_diagnostics():
 
     try:
         import yt_dlp
-        yt_version = getattr(yt_dlp, "__version__", "unknown")
+        yt_version = getattr(yt_dlp, "__version__", None)
+        if not yt_version:
+            import yt_dlp.version
+            yt_version = getattr(yt_dlp.version, "__version__", "unknown")
     except Exception as e:
         yt_version = f"error: {e}"
 
@@ -512,7 +552,7 @@ def get_diagnostics():
         ),
         "secrets_dir_exists": secrets_path.exists(),
         "secrets_files": secrets_list,
-        "server_version": "v1.2.1-auth-priority",
+        "server_version": "v1.2.2-ejs-permanent",
     }
 
 
