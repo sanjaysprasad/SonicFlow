@@ -123,6 +123,29 @@ def find_cookie_file() -> Tuple[Optional[Path], str]:
     Search for valid cookies across all possible locations, prioritizing
     files that contain true authenticated Google login tokens (LOGIN_INFO).
     """
+    # 0. Check environment variables first and write to /tmp/sonicflow_cookies.txt
+    raw_env_cookie = (
+        os.environ.get("YTDLP_COOKIES")
+        or os.environ.get("YOUTUBE_COOKIES")
+        or os.environ.get("YT_COOKIES")
+        or os.environ.get("COOKIES")
+    )
+    if raw_env_cookie:
+        try:
+            target = Path("/tmp/sonicflow_cookies.txt")
+            raw_cookie = raw_env_cookie.replace("\\n", "\n").strip()
+            if not raw_cookie.startswith("# Netscape") and "\t" not in raw_cookie:
+                try:
+                    import base64
+                    decoded = base64.b64decode(raw_cookie).decode("utf-8", errors="ignore")
+                    if "# Netscape" in decoded or "\t" in decoded:
+                        raw_cookie = decoded
+                except Exception:
+                    pass
+            target.write_text(raw_cookie)
+        except Exception as e:
+            print(f"Error parsing cookies env var: {e}")
+
     # 1. Explicit env var path
     if os.environ.get("COOKIES_PATH"):
         p = Path(os.environ["COOKIES_PATH"])
@@ -131,22 +154,23 @@ def find_cookie_file() -> Tuple[Optional[Path], str]:
             return p, f"Loaded from COOKIES_PATH: {p} ({p.stat().st_size} bytes, {note})"
 
     candidates: list[Path] = [
+        # Prioritize Render Secret Files (/etc/secrets)
+        Path("/etc/secrets/cookies.txt"),
+        Path("/etc/secrets/www.youtube.com_cookies.txt"),
+        Path("/tmp/sonicflow_cookies.txt"),
+        Path("/tmp/cookies.txt"),
         Path("www.youtube.com_cookies.txt"),
         Path("cookies.txt"),
         Path("/app/www.youtube.com_cookies.txt"),
         Path("/app/cookies.txt"),
-        Path("/etc/secrets/www.youtube.com_cookies.txt"),
-        Path("/etc/secrets/cookies.txt"),
-        Path("/tmp/sonicflow_cookies.txt"),
-        Path("/tmp/cookies.txt"),
     ]
 
-    # Check Render Secret Files directory (/etc/secrets) for ANY cookie/secret text file
+    # Check Render Secret Files directory (/etc/secrets) for ANY cookie/secret text file recursively
     secrets_dir = Path("/etc/secrets")
     if secrets_dir.exists() and secrets_dir.is_dir():
-        for f in secrets_dir.glob("*"):
+        for f in secrets_dir.rglob("*"):
             if f.is_file() and f.stat().st_size > 10 and f not in candidates:
-                candidates.append(f)
+                candidates.insert(0, f)
 
     # Check current directory and /app for any cookie-like files
     for base in [Path("."), Path("/app")]:
@@ -164,26 +188,6 @@ def find_cookie_file() -> Tuple[Optional[Path], str]:
     if chosen:
         is_auth, note = check_cookie_auth(chosen)
         return chosen, f"Found cookie file: {chosen} ({chosen.stat().st_size} bytes, {note})"
-
-    # Check environment variable
-    raw_env_cookie = os.environ.get("YTDLP_COOKIES") or os.environ.get("YOUTUBE_COOKIES")
-    if raw_env_cookie:
-        try:
-            target = Path("/tmp/sonicflow_cookies.txt")
-            raw_cookie = raw_env_cookie.replace("\\n", "\n").strip()
-            if not raw_cookie.startswith("# Netscape") and "\t" not in raw_cookie:
-                try:
-                    import base64
-                    decoded = base64.b64decode(raw_cookie).decode("utf-8", errors="ignore")
-                    if "# Netscape" in decoded or "\t" in decoded:
-                        raw_cookie = decoded
-                except Exception:
-                    pass
-            target.write_text(raw_cookie)
-            is_auth, note = check_cookie_auth(target)
-            return target, f"Loaded cookies from environment variable ({len(raw_cookie)} bytes, {note})"
-        except Exception as e:
-            print(f"Error parsing cookies env var: {e}")
 
     return None, "No cookies detected"
 
@@ -374,15 +378,17 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
 
             if "sign in to confirm" in norm_err or "confirm you're not a bot" in norm_err or "bot" in norm_err:
                 is_auth, auth_status = check_cookie_auth(found_cookie) if found_cookie else (False, "none")
+                cookie_name = found_cookie.name if found_cookie else "no cookies"
+                cookie_size_info = f", {found_cookie.stat().st_size} bytes" if (found_cookie and found_cookie.exists()) else ""
                 if not is_auth:
                     jobs[job_id]["message"] = (
-                        f"YouTube bot check triggered [{found_cookie.name if found_cookie else 'no cookies'}]. "
-                        "The uploaded cookie file does NOT contain 'LOGIN_INFO' (it was exported while logged out). "
-                        "Please export cookies from your browser while logged into YouTube and update your Render Secret File."
+                        f"YouTube bot check triggered [{cookie_name}{cookie_size_info}]. "
+                        "The cookie file currently running on Render does NOT contain 'LOGIN_INFO' (it is missing or an old export). "
+                        "If you recently updated Secret Files, please check that Render has finished deploying ('Live' status)."
                     )
                 else:
                     jobs[job_id]["message"] = (
-                        f"YouTube bot check triggered [{found_cookie.name}]. "
+                        f"YouTube bot check triggered [{cookie_name}{cookie_size_info}]. "
                         "Your session cookies may have expired or need a refresh from your browser."
                     )
             elif "403" in norm_err or "forbidden" in norm_err:
@@ -498,9 +504,15 @@ def get_diagnostics():
         "nodejs_detected": bool(node_bin),
         "nodejs_path": node_bin,
         "yt_dlp_version": yt_version,
-        "env_ytdlp_cookies_set": bool(os.environ.get("YTDLP_COOKIES") or os.environ.get("YOUTUBE_COOKIES")),
+        "env_ytdlp_cookies_set": bool(
+            os.environ.get("YTDLP_COOKIES")
+            or os.environ.get("YOUTUBE_COOKIES")
+            or os.environ.get("YT_COOKIES")
+            or os.environ.get("COOKIES")
+        ),
         "secrets_dir_exists": secrets_path.exists(),
         "secrets_files": secrets_list,
+        "server_version": "v1.2.1-auth-priority",
     }
 
 
