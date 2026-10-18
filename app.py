@@ -620,14 +620,20 @@ class AudioExtractorApp(BaseApp):
                 sys.executable, "-m", "yt_dlp",
                 "--no-check-certificates",
                 "--geo-bypass",
-                "--extractor-args", "youtube:player_client=android,ios",
-                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                "--add-header", "Accept-Language: en-US,en;q=0.9",
+                "--extractor-args", "youtube:player_client=ios,android,mweb",
             ]
 
-            cookies_file = Path("cookies.txt")
-            if cookies_file.exists():
-                cmd.extend(["--cookies", str(cookies_file.resolve())])
+            is_instagram = ("instagram.com" in url.lower() or "instagr.am" in url.lower())
+            if is_instagram:
+                cmd.extend([
+                    "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                    "--add-header", "Accept-Language: en-US,en;q=0.9",
+                ])
+
+            for cand in [Path("cookies.txt"), Path("www.youtube.com_cookies.txt")]:
+                if cand.exists() and cand.is_file() and cand.stat().st_size > 10:
+                    cmd.extend(["--cookies", str(cand.resolve())])
+                    break
 
             if is_video:
                 if quality_choice in ["2160", "1440", "1080", "720", "480"]:

@@ -14,7 +14,7 @@ import shutil
 import asyncio
 import subprocess
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
@@ -93,6 +93,73 @@ def cleanup_old_files():
         jobs.pop(jid, None)
 
 
+def find_cookie_file() -> Tuple[Optional[Path], str]:
+    """
+    Search for valid cookies across all possible locations:
+    1. COOKIES_PATH env var
+    2. Render Secret Files mount (/etc/secrets/): searches all files in directory
+    3. Project /app and working directory (*cookie*.txt, cookies.txt, www.youtube.com_cookies.txt)
+    4. /tmp/ directory
+    5. YTDLP_COOKIES or YOUTUBE_COOKIES environment variables (plain Netscape text or base64)
+    """
+    # 1. Explicit env var path
+    if os.environ.get("COOKIES_PATH"):
+        p = Path(os.environ["COOKIES_PATH"])
+        if p.is_file() and p.stat().st_size > 10:
+            return p, f"Loaded from COOKIES_PATH: {p} ({p.stat().st_size} bytes)"
+
+    candidates: list[Path] = [
+        Path("cookies.txt"),
+        Path("www.youtube.com_cookies.txt"),
+        Path("/app/cookies.txt"),
+        Path("/app/www.youtube.com_cookies.txt"),
+        Path("/etc/secrets/cookies.txt"),
+        Path("/etc/secrets/www.youtube.com_cookies.txt"),
+        Path("/tmp/cookies.txt"),
+        Path("/tmp/sonicflow_cookies.txt"),
+    ]
+
+    # Check Render Secret Files directory (/etc/secrets) for ANY cookie/secret text file
+    secrets_dir = Path("/etc/secrets")
+    if secrets_dir.exists() and secrets_dir.is_dir():
+        for f in secrets_dir.glob("*"):
+            if f.is_file() and f.stat().st_size > 10 and f not in candidates:
+                candidates.append(f)
+
+    # Check current directory and /app for any cookie-like files
+    for base in [Path("."), Path("/app")]:
+        if base.exists() and base.is_dir():
+            for f in base.glob("*cookie*.txt"):
+                if f not in candidates:
+                    candidates.append(f)
+
+    for cand in candidates:
+        if cand.exists() and cand.is_file() and cand.stat().st_size > 10:
+            return cand, f"Found cookie file: {cand} ({cand.stat().st_size} bytes)"
+
+    # Check environment variable
+    raw_env_cookie = os.environ.get("YTDLP_COOKIES") or os.environ.get("YOUTUBE_COOKIES")
+    if raw_env_cookie:
+        try:
+            target = Path("/tmp/sonicflow_cookies.txt")
+            raw_cookie = raw_env_cookie.replace("\\n", "\n").strip()
+            # Support base64 encoded cookies
+            if not raw_cookie.startswith("# Netscape") and "\t" not in raw_cookie:
+                try:
+                    import base64
+                    decoded = base64.b64decode(raw_cookie).decode("utf-8", errors="ignore")
+                    if "# Netscape" in decoded or "\t" in decoded:
+                        raw_cookie = decoded
+                except Exception:
+                    pass
+            target.write_text(raw_cookie)
+            return target, f"Loaded cookies from environment variable ({len(raw_cookie)} bytes)"
+        except Exception as e:
+            print(f"Error parsing cookies env var: {e}")
+
+    return None, "No cookies detected"
+
+
 def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
     """Background worker to download and process audio or video with multi-strategy fallback."""
     job_folder = TEMP_DIR / job_id
@@ -109,58 +176,30 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
     ffmpeg_bin = find_ffmpeg()
     ffmpeg_dir = os.path.dirname(ffmpeg_bin) if ffmpeg_bin else ""
 
-    # Search for cookies file across standard paths (including Render Secret Files & env var)
-    cookie_candidates = [
-        Path("cookies.txt"),
-        Path("www.youtube.com_cookies.txt"),
-        Path("/etc/secrets/cookies.txt"),
-        Path("/app/cookies.txt"),
-        Path("/tmp/cookies.txt")
-    ]
-    # Also discover any *cookie*.txt in current working directory
-    for f in Path(".").glob("*cookie*.txt"):
-        if f not in cookie_candidates:
-            cookie_candidates.append(f)
-
-    found_cookie = None
-    for cand in cookie_candidates:
-        if cand.exists() and cand.is_file() and cand.stat().st_size > 10:
-            found_cookie = cand
-            break
-
-    if not found_cookie and os.environ.get("YTDLP_COOKIES"):
-        try:
-            cookie_path = Path("/tmp/cookies.txt")
-            raw_cookie = os.environ["YTDLP_COOKIES"].replace("\\n", "\n").strip()
-            # Support base64 encoded cookies
-            if not raw_cookie.startswith("# Netscape") and "\t" not in raw_cookie:
-                try:
-                    import base64
-                    decoded = base64.b64decode(raw_cookie).decode("utf-8", errors="ignore")
-                    if "# Netscape" in decoded or "\t" in decoded:
-                        raw_cookie = decoded
-                except Exception:
-                    pass
-            cookie_path.write_text(raw_cookie)
-            found_cookie = cookie_path
-        except Exception as e:
-            print(f"Error writing cookies env var: {e}")
+    found_cookie, cookie_info = find_cookie_file()
+    print(f"[{job_id}] {cookie_info}")
 
     # Determine platform
     url_lower = url.lower()
     is_youtube = ("youtube.com" in url_lower or "youtu.be" in url_lower)
     is_instagram = ("instagram.com" in url_lower or "instagr.am" in url_lower)
 
-    # Multi-strategy client definitions for YouTube on datacenter IPs
-    if is_youtube and not found_cookie:
+    # Multi-strategy client definitions for YouTube (especially on Cloud / Render datacenter IPs)
+    # Crucial fix: Even WITH cookies, datacenter IPs get blocked if using 'web' client because of BotGuard PO-token enforcement.
+    # 'ios', 'android', 'mweb', and 'tv_embedded' bypass web BotGuard PO-token challenges!
+    if is_youtube:
         strategies = [
-            # Strategy 1: Mobile Web + Android + Web with native headers
-            ["--extractor-args", "youtube:player_client=mweb,android,web"],
-            # Strategy 2: TV Embedded + Web Embedded (often bypasses SABR botwall)
-            ["--extractor-args", "youtube:player_client=tv_embedded,web_embedded"],
-            # Strategy 3: Android Creator + Web
-            ["--extractor-args", "youtube:player_client=android_creator,web"],
-            # Strategy 4: Default fallback
+            # Strategy 1: iOS client (highest success rate on cloud IPs; bypasses web BotGuard PO-token)
+            ["--extractor-args", "youtube:player_client=ios,android,mweb"],
+            # Strategy 2: Android + TV Embedded (reliable fallback for music & video streams)
+            ["--extractor-args", "youtube:player_client=android,tv_embedded"],
+            # Strategy 3: Mobile Web + Web Embedded
+            ["--extractor-args", "youtube:player_client=mweb,web_embedded"],
+            # Strategy 4: Web Creator + iOS
+            ["--extractor-args", "youtube:player_client=web_creator,ios"],
+            # Strategy 5: Web with player_skip fallback
+            ["--extractor-args", "youtube:player_client=ios,web;player_skip=configs"],
+            # Strategy 6: Default fallback
             []
         ]
     else:
@@ -215,6 +254,11 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
 
         if strat_args:
             cmd.extend(strat_args)
+
+        # Support custom PO-Token env var if provided (YT_PO_TOKEN / PO_TOKEN)
+        po_token = os.environ.get("YT_PO_TOKEN") or os.environ.get("PO_TOKEN")
+        if po_token and is_youtube:
+            cmd.extend(["--extractor-args", f"youtube:po_token=web+{po_token}"])
 
         # Only pass browser user-agent for Instagram; never override YouTube's native client user-agents!
         if is_instagram:
@@ -281,37 +325,37 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
                     break
 
             last_error_lines = error_lines
-            # Check if this strategy was blocked by bot check or format error, and retry if more strategies remain
-            norm_err = " ".join(error_lines).lower().replace("’", "'")
+            # If failed and more strategies exist, retry with next resolver
             if strat_idx < len(strategies) - 1:
-                if any(k in norm_err for k in ["sign in to confirm", "bot", "requested format"]):
-                    jobs[job_id]["message"] = f"Switching client stream resolver (attempt {strat_idx + 2})..."
-                    time.sleep(0.5)
-                    continue
+                jobs[job_id]["message"] = f"Switching client stream resolver (attempt {strat_idx + 2} of {len(strategies)})..."
+                time.sleep(0.5)
+                continue
 
         except Exception as e:
             last_error_lines = [str(e)]
 
     if not success:
         jobs[job_id]["status"] = "error"
+        cookie_status = f" [Cookies: {found_cookie.name if found_cookie else 'none detected'}]"
         if last_error_lines:
             clean_err = last_error_lines[-1].replace("ERROR: ", "").strip()
             norm_err = clean_err.replace("’", "'").replace("“", '"').replace("”", '"').lower()
 
             if "sign in to confirm" in norm_err or "confirm you're not a bot" in norm_err or "bot" in norm_err:
                 jobs[job_id]["message"] = (
-                    "YouTube blocked cloud datacenter IP (bot check). "
-                    "To fix this on Render, add cookies.txt to Secret Files or run via local tunnel."
+                    f"YouTube bot check triggered{cookie_status}. "
+                    "Make sure your cookies.txt was exported while signed into YouTube and added to Render Secret Files."
                 )
+            elif "403" in norm_err or "forbidden" in norm_err:
+                jobs[job_id]["message"] = f"YouTube returned 403 Forbidden{cookie_status}. The media stream was blocked or expired."
             elif "requested format is not available" in norm_err:
                 jobs[job_id]["message"] = "Requested stream resolution is not available for this video. Try another quality."
             elif "video unavailable" in norm_err or "private video" in norm_err:
-                jobs[job_id]["message"] = "This video is private, age-restricted, or unavailable."
+                jobs[job_id]["message"] = f"This video is private, age-restricted, or unavailable{cookie_status}."
             else:
-                jobs[job_id]["message"] = f"yt-dlp: {clean_err[:130]}"
+                jobs[job_id]["message"] = f"yt-dlp error: {clean_err[:120]}{cookie_status}"
         else:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["message"] = "Conversion failed. Link may be blocked or unavailable."
+            jobs[job_id]["message"] = f"Conversion failed{cookie_status}. Link may be blocked or unavailable."
 
 
 @app.post("/api/convert")
@@ -377,6 +421,44 @@ async def download_file(job_id: str):
         filename=job["file_name"],
         media_type=media_type
     )
+
+
+@app.get("/api/diagnostics")
+def get_diagnostics():
+    """Diagnostic endpoint to inspect environment, cookie status, ffmpeg, nodejs, and yt-dlp version."""
+    found_cookie, cookie_info = find_cookie_file()
+    ffmpeg_bin = find_ffmpeg()
+    node_bin = shutil.which("node") or shutil.which("nodejs")
+
+    try:
+        import yt_dlp
+        yt_version = getattr(yt_dlp, "__version__", "unknown")
+    except Exception as e:
+        yt_version = f"error: {e}"
+
+    secrets_path = Path("/etc/secrets")
+    secrets_list = []
+    if secrets_path.exists() and secrets_path.is_dir():
+        try:
+            secrets_list = [f.name for f in secrets_path.iterdir() if f.is_file()]
+        except Exception as e:
+            secrets_list = [f"error reading secrets: {e}"]
+
+    return {
+        "status": "online",
+        "cookie_found": found_cookie is not None,
+        "cookie_source": cookie_info,
+        "cookie_path": str(found_cookie) if found_cookie else None,
+        "cookie_file_size_bytes": found_cookie.stat().st_size if found_cookie and found_cookie.exists() else 0,
+        "ffmpeg_detected": bool(ffmpeg_bin and os.path.exists(ffmpeg_bin)),
+        "ffmpeg_path": ffmpeg_bin,
+        "nodejs_detected": bool(node_bin),
+        "nodejs_path": node_bin,
+        "yt_dlp_version": yt_version,
+        "env_ytdlp_cookies_set": bool(os.environ.get("YTDLP_COOKIES") or os.environ.get("YOUTUBE_COOKIES")),
+        "secrets_dir_exists": secrets_path.exists(),
+        "secrets_files": secrets_list,
+    }
 
 
 # -------------------------------------------------------------------------
