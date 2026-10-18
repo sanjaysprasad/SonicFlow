@@ -102,21 +102,43 @@ def find_cookie_file() -> Tuple[Optional[Path], str]:
     4. /tmp/ directory
     5. YTDLP_COOKIES or YOUTUBE_COOKIES environment variables (plain Netscape text or base64)
     """
+def check_cookie_auth(path: Path) -> Tuple[bool, str]:
+    """Check if cookie file contains actual authenticated YouTube session tokens."""
+    try:
+        content = path.read_text(errors="ignore")
+        has_login = "LOGIN_INFO" in content
+        has_sid = any(k in content for k in ["SID\t", "SID ", "__Secure-1PSID"])
+        if has_login and has_sid:
+            return True, "Authenticated session (LOGIN_INFO & SID present)"
+        elif has_sid or "__Secure-3PSID" in content:
+            return False, "Unauthenticated session (missing LOGIN_INFO; guest/visitor only)"
+        else:
+            return False, "Empty or unrecognized cookie format"
+    except Exception as e:
+        return False, f"Read error: {e}"
+
+
+def find_cookie_file() -> Tuple[Optional[Path], str]:
+    """
+    Search for valid cookies across all possible locations, prioritizing
+    files that contain true authenticated Google login tokens (LOGIN_INFO).
+    """
     # 1. Explicit env var path
     if os.environ.get("COOKIES_PATH"):
         p = Path(os.environ["COOKIES_PATH"])
         if p.is_file() and p.stat().st_size > 10:
-            return p, f"Loaded from COOKIES_PATH: {p} ({p.stat().st_size} bytes)"
+            is_auth, note = check_cookie_auth(p)
+            return p, f"Loaded from COOKIES_PATH: {p} ({p.stat().st_size} bytes, {note})"
 
     candidates: list[Path] = [
-        Path("cookies.txt"),
         Path("www.youtube.com_cookies.txt"),
-        Path("/app/cookies.txt"),
+        Path("cookies.txt"),
         Path("/app/www.youtube.com_cookies.txt"),
-        Path("/etc/secrets/cookies.txt"),
+        Path("/app/cookies.txt"),
         Path("/etc/secrets/www.youtube.com_cookies.txt"),
-        Path("/tmp/cookies.txt"),
+        Path("/etc/secrets/cookies.txt"),
         Path("/tmp/sonicflow_cookies.txt"),
+        Path("/tmp/cookies.txt"),
     ]
 
     # Check Render Secret Files directory (/etc/secrets) for ANY cookie/secret text file
@@ -133,9 +155,15 @@ def find_cookie_file() -> Tuple[Optional[Path], str]:
                 if f not in candidates:
                     candidates.append(f)
 
-    for cand in candidates:
-        if cand.exists() and cand.is_file() and cand.stat().st_size > 10:
-            return cand, f"Found cookie file: {cand} ({cand.stat().st_size} bytes)"
+    existing = [c for c in candidates if c.exists() and c.is_file() and c.stat().st_size > 10]
+
+    # Prioritize authenticated cookies (with LOGIN_INFO) over anonymous visitor cookies
+    authenticated_candidates = [c for c in existing if check_cookie_auth(c)[0]]
+    chosen = authenticated_candidates[0] if authenticated_candidates else (existing[0] if existing else None)
+
+    if chosen:
+        is_auth, note = check_cookie_auth(chosen)
+        return chosen, f"Found cookie file: {chosen} ({chosen.stat().st_size} bytes, {note})"
 
     # Check environment variable
     raw_env_cookie = os.environ.get("YTDLP_COOKIES") or os.environ.get("YOUTUBE_COOKIES")
@@ -143,7 +171,6 @@ def find_cookie_file() -> Tuple[Optional[Path], str]:
         try:
             target = Path("/tmp/sonicflow_cookies.txt")
             raw_cookie = raw_env_cookie.replace("\\n", "\n").strip()
-            # Support base64 encoded cookies
             if not raw_cookie.startswith("# Netscape") and "\t" not in raw_cookie:
                 try:
                     import base64
@@ -153,7 +180,8 @@ def find_cookie_file() -> Tuple[Optional[Path], str]:
                 except Exception:
                     pass
             target.write_text(raw_cookie)
-            return target, f"Loaded cookies from environment variable ({len(raw_cookie)} bytes)"
+            is_auth, note = check_cookie_auth(target)
+            return target, f"Loaded cookies from environment variable ({len(raw_cookie)} bytes, {note})"
         except Exception as e:
             print(f"Error parsing cookies env var: {e}")
 
@@ -185,21 +213,23 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
     is_instagram = ("instagram.com" in url_lower or "instagr.am" in url_lower)
 
     # Multi-strategy client definitions for YouTube (especially on Cloud / Render datacenter IPs)
-    # Crucial fix: Even WITH cookies, datacenter IPs get blocked if using 'web' client because of BotGuard PO-token enforcement.
-    # 'ios', 'android', 'mweb', and 'tv_embedded' bypass web BotGuard PO-token challenges!
     if is_youtube:
         strategies = [
-            # Strategy 1: iOS client (highest success rate on cloud IPs; bypasses web BotGuard PO-token)
-            ["--extractor-args", "youtube:player_client=ios,android,mweb"],
-            # Strategy 2: Android + TV Embedded (reliable fallback for music & video streams)
-            ["--extractor-args", "youtube:player_client=android,tv_embedded"],
-            # Strategy 3: Mobile Web + Web Embedded
-            ["--extractor-args", "youtube:player_client=mweb,web_embedded"],
-            # Strategy 4: Web Creator + iOS
-            ["--extractor-args", "youtube:player_client=web_creator,ios"],
-            # Strategy 5: Web with player_skip fallback
-            ["--extractor-args", "youtube:player_client=ios,web;player_skip=configs"],
-            # Strategy 6: Default fallback
+            # Strategy 1: Android API with player_skip (bypasses web HTML scraper & BotGuard PO-token challenge)
+            ["--extractor-args", "youtube:player_client=android;player_skip=webpage,configs"],
+            # Strategy 2: Android standard client
+            ["--extractor-args", "youtube:player_client=android"],
+            # Strategy 3: iOS app client
+            ["--extractor-args", "youtube:player_client=ios"],
+            # Strategy 4: TV Embedded client
+            ["--extractor-args", "youtube:player_client=tv_embedded"],
+            # Strategy 5: Mobile Web client
+            ["--extractor-args", "youtube:player_client=mweb"],
+            # Strategy 6: Web Embedded client
+            ["--extractor-args", "youtube:player_client=web_embedded"],
+            # Strategy 7: Web client with cookies
+            ["--extractor-args", "youtube:player_client=web"],
+            # Strategy 8: Default fallback
             []
         ]
     else:
@@ -244,6 +274,7 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
     for strat_idx, strat_args in enumerate(strategies):
         cmd = [
             sys.executable, "-m", "yt_dlp",
+            "-4",
             "--no-check-certificates",
             "--geo-bypass",
             "--socket-timeout", "30",
@@ -342,10 +373,18 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
             norm_err = clean_err.replace("’", "'").replace("“", '"').replace("”", '"').lower()
 
             if "sign in to confirm" in norm_err or "confirm you're not a bot" in norm_err or "bot" in norm_err:
-                jobs[job_id]["message"] = (
-                    f"YouTube bot check triggered{cookie_status}. "
-                    "Make sure your cookies.txt was exported while signed into YouTube and added to Render Secret Files."
-                )
+                is_auth, auth_status = check_cookie_auth(found_cookie) if found_cookie else (False, "none")
+                if not is_auth:
+                    jobs[job_id]["message"] = (
+                        f"YouTube bot check triggered [{found_cookie.name if found_cookie else 'no cookies'}]. "
+                        "The uploaded cookie file does NOT contain 'LOGIN_INFO' (it was exported while logged out). "
+                        "Please export cookies from your browser while logged into YouTube and update your Render Secret File."
+                    )
+                else:
+                    jobs[job_id]["message"] = (
+                        f"YouTube bot check triggered [{found_cookie.name}]. "
+                        "Your session cookies may have expired or need a refresh from your browser."
+                    )
             elif "403" in norm_err or "forbidden" in norm_err:
                 jobs[job_id]["message"] = f"YouTube returned 403 Forbidden{cookie_status}. The media stream was blocked or expired."
             elif "requested format is not available" in norm_err:
@@ -444,9 +483,13 @@ def get_diagnostics():
         except Exception as e:
             secrets_list = [f"error reading secrets: {e}"]
 
+    is_auth, auth_detail = check_cookie_auth(found_cookie) if found_cookie else (False, "No cookie file found")
+
     return {
         "status": "online",
         "cookie_found": found_cookie is not None,
+        "cookie_is_authenticated": is_auth,
+        "cookie_auth_detail": auth_detail,
         "cookie_source": cookie_info,
         "cookie_path": str(found_cookie) if found_cookie else None,
         "cookie_file_size_bytes": found_cookie.stat().st_size if found_cookie and found_cookie.exists() else 0,
