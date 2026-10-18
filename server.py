@@ -504,6 +504,22 @@ def get_diagnostics():
     }
 
 
+@app.get("/icon.png")
+async def get_icon():
+    for p in [Path("icon.png"), Path("/app/icon.png")]:
+        if p.exists() and p.is_file():
+            return FileResponse(str(p), media_type="image/png")
+    raise HTTPException(status_code=404, detail="Icon not found")
+
+
+@app.get("/favicon.ico")
+async def get_favicon():
+    for p in [Path("icon.png"), Path("/app/icon.png")]:
+        if p.exists() and p.is_file():
+            return FileResponse(str(p), media_type="image/png")
+    raise HTTPException(status_code=404, detail="Favicon not found")
+
+
 # -------------------------------------------------------------------------
 # Embedded Responsive HTML/Tailwind Frontend
 # -------------------------------------------------------------------------
@@ -513,6 +529,9 @@ HTML_CONTENT = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>SonicFlow — YouTube & Instagram Audio/Video Downloader</title>
+    <!-- Favicon & Icons -->
+    <link rel="icon" type="image/png" href="/icon.png">
+    <link rel="apple-touch-icon" href="/icon.png">
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
@@ -551,10 +570,8 @@ HTML_CONTENT = """<!DOCTYPE html>
     <header class="w-full border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-md sticky top-0 z-50">
         <div class="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between">
             <div class="flex items-center space-x-3">
-                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-sky-500 to-indigo-600 flex items-center justify-center text-white shadow-lg shadow-sky-500/20">
-                    <i class="fa-solid fa-bolt text-lg"></i>
-                </div>
-                <span class="text-xl font-bold tracking-tight bg-gradient-to-r from-white to-slate-300 bg-clip-text text-transparent">SonicFlow</span>
+                <img src="/icon.png" alt="SonicFlow Logo" class="w-10 h-10 rounded-xl shadow-lg shadow-indigo-500/25 border border-white/10 hover:scale-105 transition-transform object-cover">
+                <span class="text-xl font-bold tracking-tight bg-gradient-to-r from-white via-indigo-200 to-sky-300 bg-clip-text text-transparent">SonicFlow</span>
             </div>
             <div class="flex items-center space-x-2">
                 <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
@@ -569,10 +586,14 @@ HTML_CONTENT = """<!DOCTYPE html>
     <main class="flex-1 flex items-center justify-center p-4 sm:p-6 my-6">
         <div class="w-full max-w-xl mx-auto">
 
-            <!-- Hero Text -->
+            <!-- Hero Text with Logo -->
             <div class="text-center mb-8">
+                <div class="inline-flex items-center justify-center mb-4 relative group">
+                    <div class="absolute -inset-1.5 bg-gradient-to-r from-cyan-500 via-indigo-500 to-fuchsia-500 rounded-3xl blur-md opacity-50 group-hover:opacity-85 transition duration-500"></div>
+                    <img src="/icon.png" alt="SonicFlow" class="relative w-20 h-20 rounded-2xl shadow-2xl border border-white/20 transform group-hover:scale-105 transition duration-300 object-cover">
+                </div>
                 <h1 class="text-3xl sm:text-4xl font-extrabold tracking-tight text-white mb-3">
-                    Download <span class="bg-gradient-to-r from-sky-400 to-indigo-400 bg-clip-text text-transparent">Audio & Video</span>
+                    Sonic<span class="bg-gradient-to-r from-cyan-400 via-indigo-400 to-fuchsia-400 bg-clip-text text-transparent">Flow</span>
                 </h1>
                 <p class="text-slate-400 text-sm sm:text-base max-w-md mx-auto">
                     Convert YouTube & Instagram links to high-quality audio (MP3, FLAC) or HD/4K MP4 video.
