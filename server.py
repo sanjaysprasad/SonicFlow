@@ -219,15 +219,22 @@ def find_cookie_file() -> Tuple[Optional[Path], str]:
             is_auth, note = check_cookie_auth(p)
             return p, f"Loaded from COOKIES_PATH: {p} ({p.stat().st_size} bytes, {note})"
 
+    base_dir = Path(__file__).resolve().parent
     candidates: list[Path] = [
+        Path("/etc/secrets/finalcookies.txt"),
         Path("/etc/secrets/cookies.txt"),
         Path("/etc/secrets/www.youtube.com_cookies.txt"),
         Path("/tmp/sonicflow_cookies.txt"),
         Path("/tmp/cookies.txt"),
-        Path("www.youtube.com_cookies.txt"),
+        base_dir / "finalcookies.txt",
+        base_dir / "cookies.txt",
+        base_dir / "www.youtube.com_cookies.txt",
+        Path("finalcookies.txt"),
         Path("cookies.txt"),
-        Path("/app/www.youtube.com_cookies.txt"),
+        Path("www.youtube.com_cookies.txt"),
+        Path("/app/finalcookies.txt"),
         Path("/app/cookies.txt"),
+        Path("/app/www.youtube.com_cookies.txt"),
     ]
 
     # Check Render Secret Files directory (/etc/secrets)
@@ -237,7 +244,7 @@ def find_cookie_file() -> Tuple[Optional[Path], str]:
             if f.is_file() and f.stat().st_size > 10 and f not in candidates:
                 candidates.insert(0, f)
 
-    for base in [Path("."), Path("/app")]:
+    for base in [Path("."), Path("/app"), base_dir]:
         if base.exists() and base.is_dir():
             for f in base.glob("*cookie*.txt"):
                 if f not in candidates:

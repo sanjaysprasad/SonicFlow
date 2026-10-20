@@ -705,7 +705,16 @@ class AudioExtractorApp(BaseApp):
                     "--add-header", "Accept-Language: en-US,en;q=0.9",
                 ])
 
-            for cand in [Path("cookies.txt"), Path("www.youtube.com_cookies.txt")]:
+            cookie_candidates = [
+                Path("finalcookies.txt"),
+                Path("cookies.txt"),
+                Path("www.youtube.com_cookies.txt"),
+            ]
+            for f in Path(".").glob("*cookie*.txt"):
+                if f not in cookie_candidates:
+                    cookie_candidates.append(f)
+
+            for cand in cookie_candidates:
                 if cand.exists() and cand.is_file() and cand.stat().st_size > 10:
                     cmd.extend(["--cookies", str(cand.resolve())])
                     break
