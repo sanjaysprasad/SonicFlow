@@ -175,99 +175,6 @@ def cleanup_old_files():
             jobs.pop(jid, None)
 
 
-def check_cookie_auth(path: Path) -> Tuple[bool, str]:
-    """Check if cookie file contains authenticated YouTube session tokens."""
-    try:
-        content = path.read_text(errors="ignore")
-        has_login = "LOGIN_INFO" in content
-        has_sid = any(k in content for k in ["SID\t", "SID ", "__Secure-1PSID"])
-        if has_login and has_sid:
-            return True, "Authenticated session (LOGIN_INFO & SID present)"
-        elif has_sid or "__Secure-3PSID" in content:
-            return False, "Unauthenticated session (missing LOGIN_INFO; guest/visitor only)"
-        else:
-            return False, "Empty or unrecognized cookie format"
-    except Exception as e:
-        return False, f"Read error: {e}"
-
-
-def find_cookie_file() -> Tuple[Optional[Path], str]:
-    """
-    Search for valid cookies across all possible locations, prioritizing
-    files that contain true authenticated Google login tokens (LOGIN_INFO).
-    """
-    # 0. Check environment variables first
-    raw_env_cookie = (
-        os.environ.get("YTDLP_COOKIES")
-        or os.environ.get("YOUTUBE_COOKIES")
-        or os.environ.get("YT_COOKIES")
-        or os.environ.get("COOKIES")
-    )
-    if raw_env_cookie:
-        try:
-            target = Path("/tmp/sonicflow_cookies.txt")
-            raw_cookie = raw_env_cookie.replace("\\n", "\n").strip()
-            if not raw_cookie.startswith("# Netscape") and "\t" not in raw_cookie:
-                try:
-                    import base64
-                    decoded = base64.b64decode(raw_cookie).decode("utf-8", errors="ignore")
-                    if "# Netscape" in decoded or "\t" in decoded:
-                        raw_cookie = decoded
-                except Exception:
-                    pass
-            target.write_text(raw_cookie)
-        except Exception as e:
-            print(f"Error parsing cookies env var: {e}")
-
-    # 1. Explicit env var path
-    if os.environ.get("COOKIES_PATH"):
-        p = Path(os.environ["COOKIES_PATH"])
-        if p.is_file() and p.stat().st_size > 10:
-            is_auth, note = check_cookie_auth(p)
-            return p, f"Loaded from COOKIES_PATH: {p} ({p.stat().st_size} bytes, {note})"
-
-    base_dir = Path(__file__).resolve().parent
-    candidates: list[Path] = [
-        Path("/etc/secrets/finalcookies.txt"),
-        Path("/etc/secrets/cookies.txt"),
-        Path("/etc/secrets/www.youtube.com_cookies.txt"),
-        Path("/tmp/sonicflow_cookies.txt"),
-        Path("/tmp/cookies.txt"),
-        base_dir / "finalcookies.txt",
-        base_dir / "cookies.txt",
-        base_dir / "www.youtube.com_cookies.txt",
-        Path("finalcookies.txt"),
-        Path("cookies.txt"),
-        Path("www.youtube.com_cookies.txt"),
-        Path("/app/finalcookies.txt"),
-        Path("/app/cookies.txt"),
-        Path("/app/www.youtube.com_cookies.txt"),
-    ]
-
-    # Check Render Secret Files directory (/etc/secrets)
-    secrets_dir = Path("/etc/secrets")
-    if secrets_dir.exists() and secrets_dir.is_dir():
-        for f in secrets_dir.rglob("*"):
-            if f.is_file() and f.stat().st_size > 10 and f not in candidates:
-                candidates.insert(0, f)
-
-    for base in [Path("."), Path("/app"), base_dir]:
-        if base.exists() and base.is_dir():
-            for f in base.glob("*cookie*.txt"):
-                if f not in candidates:
-                    candidates.append(f)
-
-    existing = [c for c in candidates if c.exists() and c.is_file() and c.stat().st_size > 10]
-    authenticated_candidates = [c for c in existing if check_cookie_auth(c)[0]]
-    chosen = authenticated_candidates[0] if authenticated_candidates else (existing[0] if existing else None)
-
-    if chosen:
-        is_auth, note = check_cookie_auth(chosen)
-        return chosen, f"Found cookie file: {chosen} ({chosen.stat().st_size} bytes, {note})"
-
-    return None, "No cookies detected"
-
-
 def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
     """Single bounded subprocess, with Render-visible logs and compatible job states."""
     global _active_jobs_count
@@ -289,17 +196,6 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             cmd.extend(["--ffmpeg-location", str(Path(ffmpeg).parent)])
-
-        # Attach authenticated cookies if present (Secret files: finalcookies.txt, cookies.txt)
-        found_cookie, cookie_info = find_cookie_file()
-        if found_cookie and os.getenv("SONICFLOW_USE_COOKIES", "0") == "1":
-            cookie_copy = folder / "auth_cookies.txt"
-            shutil.copyfile(found_cookie, cookie_copy)
-            cookie_copy.chmod(0o600)
-            cmd.extend(["--cookies", str(cookie_copy)])
-            logger.info("job=%s attached writable cookie copy", job_id)
-        else:
-            logger.warning("job=%s no cookies detected: %s", job_id, cookie_info)
 
         # Platform-specific extractor optimizations
         url_lower = url.lower()
@@ -323,9 +219,9 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
                         "--audio-quality", f"{q}K"])
 
         cmd.extend(["--", url])
-        logger.info("job=%s starting platform=%s format=%s quality=%s deno=%s ffmpeg=%s cookies=%s",
+        logger.info("job=%s starting platform=%s format=%s quality=%s deno=%s ffmpeg=%s",
                     job_id, urlparse(url).hostname, fmt, quality,
-                    bool(shutil.which("deno")), bool(ffmpeg), bool(found_cookie))
+                    bool(shutil.which("deno")), bool(ffmpeg))
 
         tail = deque(maxlen=35)
         timed_out = False
@@ -371,17 +267,16 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
             detail = " | ".join(tail)[-1800:]
             logger.error("job=%s yt-dlp exit=%s timed_out=%s output=%s", job_id, code, timed_out, detail)
             lower = detail.lower()
-            cookie_badge = f" [Cookies: {found_cookie.name}]" if found_cookie else " [Cookies: none detected]"
             if "confirm you're not a bot" in lower or "confirm you’re not a bot" in lower or "sign in to confirm" in lower:
                 message = "YouTube requires verification from this cloud server. Try uploading a video file below to convert it to audio instead."
             elif "403" in lower or "forbidden" in lower:
-                message = f"Media server returned HTTP 403{cookie_badge}. The stream token was revoked or expired."
+                message = "Media server returned HTTP 403. The stream was restricted or expired."
             elif "requested format is not available" in lower:
                 message = "Selected format or quality is unavailable. Try another resolution."
             elif timed_out:
                 message = "Conversion timed out on the server. Try a shorter video."
             else:
-                message = f"Download failed{cookie_badge}. Check Render logs for the yt-dlp error."
+                message = "Download failed. Check Render logs for the yt-dlp error."
             with _jobs_lock:
                 jobs[job_id].update(status="error", message=message)
             return
@@ -630,7 +525,7 @@ def get_diagnostics(token: Optional[str] = Query(None), x_admin_token: Optional[
     """
     Diagnostic endpoint.
     Public callers only receive high-level service status.
-    Detailed filesystem and cookie paths require admin authentication.
+    Detailed filesystem and runtime paths require admin authentication.
     """
     admin_secret = os.environ.get("ADMIN_TOKEN") or os.environ.get("DIAGNOSTICS_TOKEN")
     caller_token = x_admin_token or token
@@ -638,8 +533,6 @@ def get_diagnostics(token: Optional[str] = Query(None), x_admin_token: Optional[
 
     ffmpeg_bin = find_ffmpeg()
     node_bin = shutil.which("deno")
-    found_cookie, cookie_info = find_cookie_file()
-    is_auth, _ = check_cookie_auth(found_cookie) if found_cookie else (False, "none")
 
     summary = {
         "status": "online",
@@ -647,7 +540,6 @@ def get_diagnostics(token: Optional[str] = Query(None), x_admin_token: Optional[
         "version": "v1.3.1",
         "ffmpeg_ready": bool(ffmpeg_bin and (os.path.exists(ffmpeg_bin) or shutil.which(ffmpeg_bin))),
         "engine_ready": bool(node_bin),
-        "auth_ready": is_auth,
     }
 
     if is_authenticated_admin:
@@ -660,9 +552,6 @@ def get_diagnostics(token: Optional[str] = Query(None), x_admin_token: Optional[
                 pass
 
         summary.update({
-            "cookie_found": found_cookie is not None,
-            "cookie_source": cookie_info,
-            "cookie_file_size_bytes": found_cookie.stat().st_size if found_cookie and found_cookie.exists() else 0,
             "ffmpeg_path": ffmpeg_bin,
             "deno_path": node_bin,
             "secrets_files": secrets_list,

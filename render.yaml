@@ -11,5 +11,3 @@ services:
         value: 10000
       - key: MAX_CONCURRENT_JOBS
         value: "1"
-      - key: SONICFLOW_USE_COOKIES
-        value: "0"
