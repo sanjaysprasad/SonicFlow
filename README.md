@@ -48,8 +48,9 @@ python3 run_public.py
 
 ### 2. Desktop Application
 Launch the standalone GUI:
+- **macOS App**: Launch `SonicFlow.app` directly from **Applications**, Launchpad, or Spotlight. (To rebuild at any time, double-click `build_macos_app.command`).
+- **macOS Script**: Double-click `launch_desktop.command` (or run `python3 app.py`)
 - **Windows**: Double-click `launch_desktop.bat`
-- **macOS**: Double-click `launch_desktop.command` (or run `python3 app.py`)
 
 ---
 
