@@ -681,6 +681,7 @@ class AudioExtractorApp(BaseApp):
         allow_playlist = self.playlist_var.get()
 
         total = len(urls)
+        failed_count = 0
 
         for idx, url in enumerate(urls, 1):
             if not self.is_downloading:
@@ -691,11 +692,11 @@ class AudioExtractorApp(BaseApp):
 
             cmd = [
                 sys.executable, "-m", "yt_dlp",
-                "-4",
-                "--no-check-certificates",
-                "--geo-bypass",
-                "--remote-components", "ejs:github",
-                "--extractor-args", "youtube:player_client=ios,android,mweb",
+                "--newline",
+                "--retries", "10",
+                "--fragment-retries", "10",
+                "--socket-timeout", "45",
+                "--print", "after_move:SONICFLOW_OUTPUT:%(filepath)s",
             ]
 
             is_instagram = ("instagram.com" in url.lower() or "instagr.am" in url.lower())
@@ -707,9 +708,11 @@ class AudioExtractorApp(BaseApp):
 
             if is_video:
                 if quality_choice in ["2160", "1440", "1080", "720", "480"]:
-                    fmt_str = f"bv*[height<={quality_choice}]+ba/b[height<={quality_choice}]/bv*+ba/b"
+                    # Exact requested height; no silent 360p fallback.
+                    # Handles YouTube's separate 4K video/audio streams.
+                    fmt_str = f"bv*[height={quality_choice}]+ba"
                 else:
-                    fmt_str = "bv*+ba/b"
+                    fmt_str = "bv*+ba"
 
                 cmd.extend([
                     "-f", fmt_str,
@@ -743,6 +746,9 @@ class AudioExtractorApp(BaseApp):
             cmd.extend(["--", url])
 
             try:
+                output_file = None
+                self.after(0, self.append_log,
+                           f"Requested video resolution: {quality_choice}p" if is_video else f"Audio format: {fmt_raw.upper()}")
                 self.current_process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -757,6 +763,8 @@ class AudioExtractorApp(BaseApp):
                     if not clean_line:
                         continue
 
+                    if clean_line.startswith("SONICFLOW_OUTPUT:"):
+                        output_file = clean_line[len("SONICFLOW_OUTPUT:"):]
                     self.after(0, self.append_log, clean_line)
 
                     if "[download]" in clean_line and "%" in clean_line:
@@ -772,14 +780,35 @@ class AudioExtractorApp(BaseApp):
                 self.current_process.wait()
                 rc = self.current_process.returncode
 
+                if rc == 0 and is_video and output_file:
+                    # Read the actual encoded stream rather than trusting the filename.
+                    probe = find_binary("ffprobe")
+                    try:
+                        result = subprocess.run(
+                            [probe, "-v", "error", "-select_streams", "v:0",
+                             "-show_entries", "stream=width,height",
+                             "-of", "csv=p=0:s=x", output_file],
+                            capture_output=True, text=True, timeout=20, check=True
+                        )
+                        actual = result.stdout.strip().splitlines()[0]
+                        self.after(0, self.append_log, f"Verified output resolution: {actual}")
+                        if quality_choice != "best" and int(actual.split("x")[-1]) != int(quality_choice):
+                            rc = 1
+                            self.after(0, self.append_log,
+                                       f"⚠ Output does not match requested {quality_choice}p. File retained for inspection.")
+                    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
+                        self.after(0, self.append_log, f"⚠ Could not inspect video resolution: {exc}")
+
                 if rc == 0:
                     self.after(0, self.append_log, f"✓ Finished item {idx}/{total}")
                 else:
+                    failed_count += 1
                     self.after(0, self.append_log, f"⚠ Error processing URL (Exit code {rc}).")
                     if not self.log_expanded:
                         self.after(0, self.toggle_log)
 
             except Exception as e:
+                failed_count += 1
                 self.after(0, self.append_log, f"❌ Download error: {str(e)}")
                 if not self.log_expanded:
                     self.after(0, self.toggle_log)
@@ -791,8 +820,13 @@ class AudioExtractorApp(BaseApp):
             self.download_btn.configure(state="normal")
             self.cancel_btn.configure(state="disabled")
             self.progress_bar.set(1.0)
-            self.update_status("Completed! All items processed.", 1.0)
-            messagebox.showinfo("Download Complete", f"All conversions finished!\nFiles saved in:\n{destination}")
+            self.update_status(f"Processed {total} item(s), {failed_count} failed.", 1.0)
+            if failed_count:
+                messagebox.showwarning("SonicFlow Results",
+                    f"{failed_count} of {total} item(s) failed. Check View Log for details.\nFiles saved in:\n{destination}")
+            else:
+                messagebox.showinfo("Download Complete",
+                    f"All conversions finished!\nFiles saved in:\n{destination}")
 
         self.after(0, finalize)
 
