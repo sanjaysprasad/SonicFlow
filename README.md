@@ -36,23 +36,20 @@
 
 ### 1. Web Application (Mobile & PC)
 Run the local web server:
-```bash
-python3 server.py
-```
+- **Windows**: Double-click `launch_web.bat`
+- **macOS**: Double-click `launch_public_website.command` (or run `python3 server.py`)
+
 Open **[http://localhost:8000](http://localhost:8000)** in your browser.
 
 To share an instant **public HTTPS link** for your phone or friends:
 ```bash
 python3 run_public.py
-# Or double-click launch_public_website.command
 ```
 
 ### 2. Desktop Application
 Launch the standalone GUI:
-```bash
-python3 app.py
-# Or double-click launch_desktop.command
-```
+- **Windows**: Double-click `launch_desktop.bat`
+- **macOS**: Double-click `launch_desktop.command` (or run `python3 app.py`)
 
 ---
 
