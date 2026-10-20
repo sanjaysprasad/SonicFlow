@@ -21,7 +21,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, Any, Optional, Tuple, Set
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Header
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Header, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -45,6 +45,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 # In-memory job state store and concurrency controls
 jobs: Dict[str, Dict[str, Any]] = {}
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1"))
+MAX_UPLOAD_BYTES = 75 * 1024 * 1024
 _active_jobs_count = 0
 _jobs_lock = threading.Lock()
 
@@ -191,16 +192,80 @@ def check_cookie_auth(path: Path) -> Tuple[bool, str]:
 
 
 def find_cookie_file() -> Tuple[Optional[Path], str]:
-    """Explicit, opt-in cookie source only; never scan repository or arbitrary secrets."""
-    if os.environ.get("SONICFLOW_USE_COOKIES", "0") != "1":
-        return None, "Disabled (default)"
-    configured = os.environ.get("COOKIES_PATH", "")
-    if not configured:
-        return None, "No explicit COOKIES_PATH configured"
-    path = Path(configured)
-    if not path.is_file() or path.stat().st_size < 20:
-        return None, "Configured cookie file missing or empty"
-    return path, "Explicit cookie file configured"
+    """
+    Search for valid cookies across all possible locations, prioritizing
+    files that contain true authenticated Google login tokens (LOGIN_INFO).
+    """
+    # 0. Check environment variables first
+    raw_env_cookie = (
+        os.environ.get("YTDLP_COOKIES")
+        or os.environ.get("YOUTUBE_COOKIES")
+        or os.environ.get("YT_COOKIES")
+        or os.environ.get("COOKIES")
+    )
+    if raw_env_cookie:
+        try:
+            target = Path("/tmp/sonicflow_cookies.txt")
+            raw_cookie = raw_env_cookie.replace("\\n", "\n").strip()
+            if not raw_cookie.startswith("# Netscape") and "\t" not in raw_cookie:
+                try:
+                    import base64
+                    decoded = base64.b64decode(raw_cookie).decode("utf-8", errors="ignore")
+                    if "# Netscape" in decoded or "\t" in decoded:
+                        raw_cookie = decoded
+                except Exception:
+                    pass
+            target.write_text(raw_cookie)
+        except Exception as e:
+            print(f"Error parsing cookies env var: {e}")
+
+    # 1. Explicit env var path
+    if os.environ.get("COOKIES_PATH"):
+        p = Path(os.environ["COOKIES_PATH"])
+        if p.is_file() and p.stat().st_size > 10:
+            is_auth, note = check_cookie_auth(p)
+            return p, f"Loaded from COOKIES_PATH: {p} ({p.stat().st_size} bytes, {note})"
+
+    base_dir = Path(__file__).resolve().parent
+    candidates: list[Path] = [
+        Path("/etc/secrets/finalcookies.txt"),
+        Path("/etc/secrets/cookies.txt"),
+        Path("/etc/secrets/www.youtube.com_cookies.txt"),
+        Path("/tmp/sonicflow_cookies.txt"),
+        Path("/tmp/cookies.txt"),
+        base_dir / "finalcookies.txt",
+        base_dir / "cookies.txt",
+        base_dir / "www.youtube.com_cookies.txt",
+        Path("finalcookies.txt"),
+        Path("cookies.txt"),
+        Path("www.youtube.com_cookies.txt"),
+        Path("/app/finalcookies.txt"),
+        Path("/app/cookies.txt"),
+        Path("/app/www.youtube.com_cookies.txt"),
+    ]
+
+    # Check Render Secret Files directory (/etc/secrets)
+    secrets_dir = Path("/etc/secrets")
+    if secrets_dir.exists() and secrets_dir.is_dir():
+        for f in secrets_dir.rglob("*"):
+            if f.is_file() and f.stat().st_size > 10 and f not in candidates:
+                candidates.insert(0, f)
+
+    for base in [Path("."), Path("/app"), base_dir]:
+        if base.exists() and base.is_dir():
+            for f in base.glob("*cookie*.txt"):
+                if f not in candidates:
+                    candidates.append(f)
+
+    existing = [c for c in candidates if c.exists() and c.is_file() and c.stat().st_size > 10]
+    authenticated_candidates = [c for c in existing if check_cookie_auth(c)[0]]
+    chosen = authenticated_candidates[0] if authenticated_candidates else (existing[0] if existing else None)
+
+    if chosen:
+        is_auth, note = check_cookie_auth(chosen)
+        return chosen, f"Found cookie file: {chosen} ({chosen.stat().st_size} bytes, {note})"
+
+    return None, "No cookies detected"
 
 
 def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
@@ -227,22 +292,19 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
 
         # Attach authenticated cookies if present (Secret files: finalcookies.txt, cookies.txt)
         found_cookie, cookie_info = find_cookie_file()
-        if found_cookie:
-            # Render Secret Files are read-only. yt-dlp may save cookies on exit.
-            # Use a private writable job-scoped copy instead.
-            cookie_copy = folder / "session_cookies.txt"
+        if found_cookie and os.getenv("SONICFLOW_USE_COOKIES", "0") == "1":
+            cookie_copy = folder / "auth_cookies.txt"
             shutil.copyfile(found_cookie, cookie_copy)
             cookie_copy.chmod(0o600)
             cmd.extend(["--cookies", str(cookie_copy)])
-            logger.info("job=%s configured cookies attached via private temporary copy", job_id)
+            logger.info("job=%s attached writable cookie copy", job_id)
         else:
-            logger.info("job=%s cookies not used: %s", job_id, cookie_info)
+            logger.warning("job=%s no cookies detected: %s", job_id, cookie_info)
 
         # Platform-specific extractor optimizations
         url_lower = url.lower()
         if "youtube.com" in url_lower or "youtu.be" in url_lower:
-            # Use yt-dlp's maintained default client selection, not fragile forced clients.
-            pass
+            pass  # Use yt-dlp default clients; do not force incompatible clients
         elif "instagram.com" in url_lower or "instagr.am" in url_lower:
             cmd.extend([
                 "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -309,9 +371,9 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
             detail = " | ".join(tail)[-1800:]
             logger.error("job=%s yt-dlp exit=%s timed_out=%s output=%s", job_id, code, timed_out, detail)
             lower = detail.lower()
-            cookie_badge = " [Session configured]" if found_cookie else ""
-            if "confirm you're not a bot" in lower or "sign in to confirm" in lower:
-                message = "YouTube requires verification for this Render server. This is an access restriction, not an MP3 conversion error."
+            cookie_badge = f" [Cookies: {found_cookie.name}]" if found_cookie else " [Cookies: none detected]"
+            if "confirm you're not a bot" in lower or "confirm you’re not a bot" in lower or "sign in to confirm" in lower:
+                message = "YouTube requires verification from this cloud server. Try uploading a video file below to convert it to audio instead."
             elif "403" in lower or "forbidden" in lower:
                 message = f"Media server returned HTTP 403{cookie_badge}. The stream token was revoked or expired."
             elif "requested format is not available" in lower:
@@ -346,6 +408,109 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
         with _jobs_lock:
             _active_jobs_count = max(0, _active_jobs_count - 1)
 
+
+
+# Upload-to-audio fallback: does not contact YouTube and retains all existing URL formats.
+UPLOAD_INPUT_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}
+UPLOAD_AUDIO_FORMATS = {"mp3", "flac", "wav", "aac", "opus", "alac"}
+
+
+def run_upload_audio_worker(job_id: str, fmt: str, quality: str):
+    global _active_jobs_count
+    folder = TEMP_DIR / job_id
+    input_path = folder / "source_video"
+    output_path = folder / ("SonicFlow_audio." + ("m4a" if fmt == "alac" else fmt))
+    try:
+        with _jobs_lock:
+            jobs[job_id].update(status="processing", progress=35, message="Extracting audio from uploaded video...")
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("FFmpeg is not installed on the server")
+        cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", str(input_path), "-vn", "-map", "0:a:0"]
+        if fmt == "mp3":
+            cmd += ["-c:a", "libmp3lame", "-b:a", f"{quality}k", "-id3v2_version", "3"]
+        elif fmt == "aac":
+            cmd += ["-c:a", "aac", "-b:a", f"{quality}k", "-f", "adts"]
+        elif fmt == "opus":
+            cmd += ["-c:a", "libopus", "-b:a", f"{min(int(quality), 256)}k"]
+        elif fmt == "flac":
+            cmd += ["-c:a", "flac"]
+        elif fmt == "wav":
+            cmd += ["-c:a", "pcm_s16le"]
+        elif fmt == "alac":
+            cmd += ["-c:a", "alac"]
+        cmd.append(str(output_path))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
+        if result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size == 0:
+            logger.error("job=%s upload ffmpeg failed exit=%s error=%s", job_id, result.returncode, result.stderr[-1200:])
+            raise RuntimeError("Audio conversion failed. Check whether the video contains an audio track.")
+        input_path.unlink(missing_ok=True)
+        with _jobs_lock:
+            jobs[job_id].update(status="completed", progress=100, message="Audio file ready!",
+                                file_path=str(output_path), file_name=output_path.name,
+                                file_size=output_path.stat().st_size)
+    except subprocess.TimeoutExpired:
+        logger.error("job=%s FFmpeg timed out", job_id)
+        with _jobs_lock:
+            jobs[job_id].update(status="error", message="Conversion timed out. Try a shorter video.")
+    except Exception as exc:
+        logger.exception("job=%s upload conversion failure", job_id)
+        with _jobs_lock:
+            jobs[job_id].update(status="error", message=str(exc)[:180])
+    finally:
+        input_path.unlink(missing_ok=True)
+        with _jobs_lock:
+            _active_jobs_count = max(0, _active_jobs_count - 1)
+
+
+@app.post("/api/upload-audio")
+async def upload_audio(background_tasks: BackgroundTasks,
+                       video: UploadFile = File(...),
+                       format: str = Form("mp3"),
+                       quality: str = Form("192")):
+    global _active_jobs_count
+    cleanup_old_files()
+    fmt = format.lower().strip()
+    if fmt not in UPLOAD_AUDIO_FORMATS:
+        raise HTTPException(status_code=400, detail="Choose an audio format: MP3, FLAC, WAV, AAC, OPUS, or ALAC.")
+    if quality not in {"96", "128", "160", "192", "256", "320"}:
+        quality = "192"
+    ext = Path(video.filename or "").suffix.lower()
+    if ext not in UPLOAD_INPUT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Upload an MP4, MOV, MKV, WebM, M4V, or AVI video.")
+    with _jobs_lock:
+        if _active_jobs_count >= MAX_CONCURRENT_JOBS:
+            raise HTTPException(status_code=429, detail="Server busy. Please try again shortly.")
+        _active_jobs_count += 1
+    job_id = uuid.uuid4().hex[:12]
+    folder = TEMP_DIR / job_id
+    folder.mkdir(parents=True, exist_ok=False)
+    with _jobs_lock:
+        jobs[job_id] = {"status": "queued", "progress": 5, "message": "Uploading video...",
+                        "created_at": time.time(), "file_path": None, "file_name": None,
+                        "format": fmt, "quality": quality}
+    try:
+        uploaded = 0
+        with (folder / "source_video").open("wb") as target:
+            while True:
+                chunk = await video.read(1024 * 1024)
+                if not chunk:
+                    break
+                uploaded += len(chunk)
+                if uploaded > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Upload exceeds 75 MB limit.")
+                target.write(chunk)
+        if uploaded == 0:
+            raise HTTPException(status_code=400, detail="Empty video file.")
+        background_tasks.add_task(run_upload_audio_worker, job_id, fmt, quality)
+        return {"job_id": job_id, "status": "queued"}
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        with _jobs_lock:
+            jobs.pop(job_id, None)
+            _active_jobs_count = max(0, _active_jobs_count - 1)
+        raise
+    finally:
+        await video.close()
 
 @app.post("/api/convert")
 async def start_conversion(payload: ConvertRequest, background_tasks: BackgroundTasks):
@@ -803,6 +968,30 @@ HTML_CONTENT = """<!DOCTYPE html>
 
             </div>
 
+
+            <!-- File conversion fallback: video -> audio; no YouTube authentication required -->
+            <section class="studio-card rounded-2xl p-5 sm:p-6 mt-5" aria-label="Upload a video and convert to audio">
+                <h2 class="text-base font-bold text-white mb-1">Convert a video file to music</h2>
+                <p class="text-xs text-slate-400 mb-4">YouTube blocking the link? Upload a video you own or can convert. All original URL formats remain available above.</p>
+                <input id="localVideo" type="file" accept=".mp4,.mov,.webm,.mkv,.m4v,.avi,video/*" class="w-full text-sm text-slate-300 mb-3 file:rounded-lg file:border-0 file:bg-sky-600 file:text-white file:px-3 file:py-2" />
+                <div class="grid grid-cols-2 gap-3 mb-3">
+                    <label class="text-xs text-slate-400">Audio format
+                        <select id="uploadFormat" class="mt-1 block w-full bg-obsidian-900 border border-white/10 rounded-lg p-2 text-white">
+                            <option value="mp3">MP3</option><option value="flac">FLAC</option><option value="wav">WAV</option><option value="aac">AAC</option><option value="opus">OPUS</option><option value="alac">ALAC</option>
+                        </select>
+                    </label>
+                    <label class="text-xs text-slate-400">Audio bitrate
+                        <select id="uploadQuality" class="mt-1 block w-full bg-obsidian-900 border border-white/10 rounded-lg p-2 text-white">
+                            <option value="320">320 kbps</option><option value="256">256 kbps</option><option value="192" selected>192 kbps</option><option value="160">160 kbps</option><option value="128">128 kbps</option><option value="96">96 kbps</option>
+                        </select>
+                    </label>
+                </div>
+                <button id="uploadButton" type="button" onclick="startFileConversion()" class="bg-accent-500 hover:bg-accent-600 text-white rounded-xl py-3 w-full font-semibold text-sm">Convert Uploaded Video</button>
+                <p class="text-xs text-slate-500 mt-2">Maximum 75 MB. Bitrate applies to compressed audio; FLAC, WAV and ALAC are lossless encodings, not quality upgrades.</p>
+                <p id="uploadStatus" role="status" class="text-xs text-slate-300 mt-3"></p>
+                <a id="uploadResult" href="#" class="hidden mt-3 inline-flex rounded-lg px-4 py-2 bg-emerald-600 text-white text-sm font-semibold">Download converted audio</a>
+            </section>
+
             <!-- Helpful Hints -->
             <div class="mt-6 text-center text-xs text-slate-500 space-y-1">
                 <p>Supports YouTube Videos, Shorts, Playlists & Instagram Reels</p>
@@ -819,6 +1008,50 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     <!-- Frontend Interactive Logic -->
     <script>
+
+        async function startFileConversion() {
+            const file = document.getElementById('localVideo').files[0];
+            const status = document.getElementById('uploadStatus');
+            const button = document.getElementById('uploadButton');
+            const link = document.getElementById('uploadResult');
+            link.classList.add('hidden');
+            if (!file) { status.textContent = 'Choose a video file first.'; return; }
+            if (file.size > 75 * 1024 * 1024) { status.textContent = 'Maximum upload size is 75 MB.'; return; }
+            const data = new FormData();
+            data.append('video', file);
+            data.append('format', document.getElementById('uploadFormat').value);
+            data.append('quality', document.getElementById('uploadQuality').value);
+            button.disabled = true;
+            status.textContent = 'Uploading video...';
+            try {
+                const response = await fetch('/api/upload-audio', {method: 'POST', body: data});
+                const payload = await response.json();
+                if (!response.ok) throw new Error(payload.detail || 'Upload failed');
+                status.textContent = 'Converting audio...';
+                let completed = false;
+                for (let i = 0; i < 240; i++) {
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                    const r = await fetch('/api/status/' + payload.job_id);
+                    if (!r.ok) throw new Error('Job expired or server restarted');
+                    const job = await r.json();
+                    status.textContent = job.message || 'Processing...';
+                    if (job.status === 'completed') {
+                        link.href = '/api/download/' + payload.job_id;
+                        link.download = job.file_name || 'SonicFlow_audio';
+                        link.classList.remove('hidden');
+                        completed = true;
+                        break;
+                    }
+                    if (job.status === 'error') throw new Error(job.message || 'Conversion failed');
+                }
+                if (!completed) throw new Error('Conversion is taking too long. Check Render logs.');
+            } catch (err) {
+                status.textContent = err.message;
+            } finally {
+                button.disabled = false;
+            }
+        }
+
         let currentMode = 'audio';
         let currentFormat = 'mp3';
         let currentQuality = '320';
