@@ -191,80 +191,16 @@ def check_cookie_auth(path: Path) -> Tuple[bool, str]:
 
 
 def find_cookie_file() -> Tuple[Optional[Path], str]:
-    """
-    Search for valid cookies across all possible locations, prioritizing
-    files that contain true authenticated Google login tokens (LOGIN_INFO).
-    """
-    # 0. Check environment variables first
-    raw_env_cookie = (
-        os.environ.get("YTDLP_COOKIES")
-        or os.environ.get("YOUTUBE_COOKIES")
-        or os.environ.get("YT_COOKIES")
-        or os.environ.get("COOKIES")
-    )
-    if raw_env_cookie:
-        try:
-            target = Path("/tmp/sonicflow_cookies.txt")
-            raw_cookie = raw_env_cookie.replace("\\n", "\n").strip()
-            if not raw_cookie.startswith("# Netscape") and "\t" not in raw_cookie:
-                try:
-                    import base64
-                    decoded = base64.b64decode(raw_cookie).decode("utf-8", errors="ignore")
-                    if "# Netscape" in decoded or "\t" in decoded:
-                        raw_cookie = decoded
-                except Exception:
-                    pass
-            target.write_text(raw_cookie)
-        except Exception as e:
-            print(f"Error parsing cookies env var: {e}")
-
-    # 1. Explicit env var path
-    if os.environ.get("COOKIES_PATH"):
-        p = Path(os.environ["COOKIES_PATH"])
-        if p.is_file() and p.stat().st_size > 10:
-            is_auth, note = check_cookie_auth(p)
-            return p, f"Loaded from COOKIES_PATH: {p} ({p.stat().st_size} bytes, {note})"
-
-    base_dir = Path(__file__).resolve().parent
-    candidates: list[Path] = [
-        Path("/etc/secrets/finalcookies.txt"),
-        Path("/etc/secrets/cookies.txt"),
-        Path("/etc/secrets/www.youtube.com_cookies.txt"),
-        Path("/tmp/sonicflow_cookies.txt"),
-        Path("/tmp/cookies.txt"),
-        base_dir / "finalcookies.txt",
-        base_dir / "cookies.txt",
-        base_dir / "www.youtube.com_cookies.txt",
-        Path("finalcookies.txt"),
-        Path("cookies.txt"),
-        Path("www.youtube.com_cookies.txt"),
-        Path("/app/finalcookies.txt"),
-        Path("/app/cookies.txt"),
-        Path("/app/www.youtube.com_cookies.txt"),
-    ]
-
-    # Check Render Secret Files directory (/etc/secrets)
-    secrets_dir = Path("/etc/secrets")
-    if secrets_dir.exists() and secrets_dir.is_dir():
-        for f in secrets_dir.rglob("*"):
-            if f.is_file() and f.stat().st_size > 10 and f not in candidates:
-                candidates.insert(0, f)
-
-    for base in [Path("."), Path("/app"), base_dir]:
-        if base.exists() and base.is_dir():
-            for f in base.glob("*cookie*.txt"):
-                if f not in candidates:
-                    candidates.append(f)
-
-    existing = [c for c in candidates if c.exists() and c.is_file() and c.stat().st_size > 10]
-    authenticated_candidates = [c for c in existing if check_cookie_auth(c)[0]]
-    chosen = authenticated_candidates[0] if authenticated_candidates else (existing[0] if existing else None)
-
-    if chosen:
-        is_auth, note = check_cookie_auth(chosen)
-        return chosen, f"Found cookie file: {chosen} ({chosen.stat().st_size} bytes, {note})"
-
-    return None, "No cookies detected"
+    """Explicit, opt-in cookie source only; never scan repository or arbitrary secrets."""
+    if os.environ.get("SONICFLOW_USE_COOKIES", "0") != "1":
+        return None, "Disabled (default)"
+    configured = os.environ.get("COOKIES_PATH", "")
+    if not configured:
+        return None, "No explicit COOKIES_PATH configured"
+    path = Path(configured)
+    if not path.is_file() or path.stat().st_size < 20:
+        return None, "Configured cookie file missing or empty"
+    return path, "Explicit cookie file configured"
 
 
 def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
@@ -292,15 +228,21 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
         # Attach authenticated cookies if present (Secret files: finalcookies.txt, cookies.txt)
         found_cookie, cookie_info = find_cookie_file()
         if found_cookie:
-            cmd.extend(["--cookies", str(found_cookie.resolve())])
-            logger.info("job=%s attached cookies: %s", job_id, cookie_info)
+            # Render Secret Files are read-only. yt-dlp may save cookies on exit.
+            # Use a private writable job-scoped copy instead.
+            cookie_copy = folder / "session_cookies.txt"
+            shutil.copyfile(found_cookie, cookie_copy)
+            cookie_copy.chmod(0o600)
+            cmd.extend(["--cookies", str(cookie_copy)])
+            logger.info("job=%s configured cookies attached via private temporary copy", job_id)
         else:
-            logger.warning("job=%s no cookies detected: %s", job_id, cookie_info)
+            logger.info("job=%s cookies not used: %s", job_id, cookie_info)
 
         # Platform-specific extractor optimizations
         url_lower = url.lower()
         if "youtube.com" in url_lower or "youtu.be" in url_lower:
-            cmd.extend(["--extractor-args", "youtube:player_client=android,web,mweb"])
+            # Use yt-dlp's maintained default client selection, not fragile forced clients.
+            pass
         elif "instagram.com" in url_lower or "instagr.am" in url_lower:
             cmd.extend([
                 "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -367,9 +309,9 @@ def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
             detail = " | ".join(tail)[-1800:]
             logger.error("job=%s yt-dlp exit=%s timed_out=%s output=%s", job_id, code, timed_out, detail)
             lower = detail.lower()
-            cookie_badge = f" [Cookies: {found_cookie.name}]" if found_cookie else " [Cookies: none detected]"
+            cookie_badge = " [Session configured]" if found_cookie else ""
             if "confirm you're not a bot" in lower or "sign in to confirm" in lower:
-                message = f"YouTube requested verification from this server{cookie_badge}. Ensure cookies are mounted in Render Secret Files."
+                message = "YouTube requires verification for this Render server. This is an access restriction, not an MP3 conversion error."
             elif "403" in lower or "forbidden" in lower:
                 message = f"Media server returned HTTP 403{cookie_badge}. The stream token was revoked or expired."
             elif "requested format is not available" in lower:
