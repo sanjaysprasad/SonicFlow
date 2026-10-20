@@ -15,6 +15,8 @@ import shutil
 import asyncio
 import threading
 import subprocess
+import logging
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, Any, Optional, Tuple, Set
@@ -24,7 +26,9 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="SonicFlow Web", version="1.3.0")
+app = FastAPI(title="SonicFlow Web", version="1.3.1")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("sonicflow")
 
 # Security: Wildcard origins without credentials prevents cross-origin session hijacking
 app.add_middleware(
@@ -40,7 +44,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory job state store and concurrency controls
 jobs: Dict[str, Dict[str, Any]] = {}
-MAX_CONCURRENT_JOBS = 5
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1"))
 _active_jobs_count = 0
 _jobs_lock = threading.Lock()
 
@@ -104,9 +108,11 @@ def validate_and_sanitize_url(raw_url: str) -> str:
     except Exception:
         raise ValueError("Malformed URL.")
 
-    if parsed.scheme not in ("http", "https"):
+    if parsed.scheme != "https":
         raise ValueError("Invalid protocol: only HTTP and HTTPS are permitted.")
 
+    if parsed.username or parsed.password or parsed.port:
+        raise ValueError("Invalid URL authority.")
     hostname = (parsed.hostname or "").lower()
     if not hostname:
         raise ValueError("URL is missing a valid host.")
@@ -158,7 +164,7 @@ def cleanup_old_files():
     expired_jobs = []
     with _jobs_lock:
         for jid, job in list(jobs.items()):
-            if now - job.get("created_at", now) > 900:  # 15 minutes
+            if job.get("status") in ("completed", "error") and now - job.get("created_at", now) > 900:
                 expired_jobs.append(jid)
                 job_folder = TEMP_DIR / jid
                 if job_folder.exists():
@@ -262,249 +268,138 @@ def find_cookie_file() -> Tuple[Optional[Path], str]:
 
 
 def run_yt_dlp_worker(job_id: str, url: str, fmt: str, quality: str):
-    """Background worker to download and process audio or video with multi-strategy fallback."""
+    """Single bounded subprocess, with Render-visible logs and compatible job states."""
     global _active_jobs_count
-    job_folder = TEMP_DIR / job_id
-    job_folder.mkdir(parents=True, exist_ok=True)
-
+    folder = TEMP_DIR / job_id
+    folder.mkdir(parents=True, exist_ok=True)
     try:
-        fmt = fmt.lower()
-        is_video = (fmt == "mp4")
-
         with _jobs_lock:
-            jobs[job_id]["status"] = "processing"
-            jobs[job_id]["progress"] = 10
-            jobs[job_id]["message"] = f"Connecting to stream..."
+            jobs[job_id].update(status="processing", progress=10, message="Connecting to media source...")
 
-        output_template = str(job_folder / "%(title)s.%(ext)s")
-        ffmpeg_bin = find_ffmpeg()
-        ffmpeg_dir = os.path.dirname(ffmpeg_bin) if ffmpeg_bin else ""
+        output_template = str(folder / "%(title)s.%(ext)s")
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "--no-playlist", "--newline", "--no-overwrites",
+            "--retries", "2", "--fragment-retries", "2",
+            "--socket-timeout", "25", "--max-filesize", "500M",
+            "--no-progress" if os.getenv("SONICFLOW_NO_PROGRESS") == "1" else "--progress",
+            "-o", output_template,
+        ]
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            cmd.extend(["--ffmpeg-location", str(Path(ffmpeg).parent)])
 
+        # Attach authenticated cookies if present (Secret files: finalcookies.txt, cookies.txt)
         found_cookie, cookie_info = find_cookie_file()
+        if found_cookie:
+            cmd.extend(["--cookies", str(found_cookie.resolve())])
+            logger.info("job=%s attached cookies: %s", job_id, cookie_info)
+        else:
+            logger.warning("job=%s no cookies detected: %s", job_id, cookie_info)
 
-        # Determine platform
+        # Platform-specific extractor optimizations
         url_lower = url.lower()
-        is_youtube = ("youtube.com" in url_lower or "youtu.be" in url_lower)
-        is_instagram = ("instagram.com" in url_lower or "instagr.am" in url_lower)
+        if "youtube.com" in url_lower or "youtu.be" in url_lower:
+            cmd.extend(["--extractor-args", "youtube:player_client=android,web,mweb"])
+        elif "instagram.com" in url_lower or "instagr.am" in url_lower:
+            cmd.extend([
+                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "--add-header", "Accept-Language: en-US,en;q=0.9",
+            ])
 
-        # Multi-strategy client definitions for YouTube
-        if is_youtube:
-            strategies = [
-                # Strategy 1: Remote EJS solver without cookies (Fastest, solves JS challenges via Node.js)
-                {
-                    "name": "EJS Challenge Solver (Node.js)",
-                    "args": ["--remote-components", "ejs:github"],
-                    "use_cookies": False
-                },
-                # Strategy 2: Android API without cookies
-                {
-                    "name": "Android API (cookieless)",
-                    "args": ["--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=android;player_skip=webpage,configs"],
-                    "use_cookies": False
-                },
-                # Strategy 3: TV Embedded without cookies
-                {
-                    "name": "TV Embedded (cookieless)",
-                    "args": ["--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=tv_embedded"],
-                    "use_cookies": False
-                },
-                # Strategy 4: Web client WITH cookies + EJS (For age-restricted / private / member-only videos)
-                {
-                    "name": "Web Session (with cookies)",
-                    "args": ["--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=web"],
-                    "use_cookies": True
-                },
-                # Strategy 5: Mobile Web WITH cookies + EJS
-                {
-                    "name": "Mobile Web (with cookies)",
-                    "args": ["--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=mweb"],
-                    "use_cookies": True
-                },
-                # Strategy 6: iOS client without cookies
-                {
-                    "name": "iOS API (cookieless)",
-                    "args": ["--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=ios"],
-                    "use_cookies": False
-                },
-                # Strategy 7: Fallback with cookies
-                {
-                    "name": "Default Fallback",
-                    "args": ["--remote-components", "ejs:github"],
-                    "use_cookies": True
-                }
-            ]
-        else:
-            strategies = [
-                {
-                    "name": "Direct Media Extractor",
-                    "args": [],
-                    "use_cookies": True
-                }
-            ]
-
-        # Video / Audio format flags
-        if is_video:
-            res = quality.strip().lower().replace("p", "")
-            if res in ["480", "720", "1080", "1440", "2160"]:
-                fmt_str = f"bv*[height<={res}]+ba/b[height<={res}]/bv*+ba/b"
-            else:
-                fmt_str = "bv*+ba/b"
-            format_args = [
-                "-f", fmt_str,
+        if fmt == "mp4":
+            resolution = quality if quality in {"480", "720", "1080", "1440", "2160"} else "1080"
+            cmd.extend([
+                "-f", f"bv*[height<={resolution}]+ba/b[height<={resolution}]/best",
                 "--merge-output-format", "mp4",
-                "--add-metadata",
-                "--embed-thumbnail",
-                "--no-playlist",
-                "-o", output_template
-            ]
+            ])
         else:
-            if fmt in ["flac", "wav", "alac"]:
-                q_arg = "0"
-            elif quality in ["320", "256", "192", "128", "96", "160"]:
-                q_arg = f"{quality}k"
-            else:
-                q_arg = "320k"
-            format_args = [
-                "-f", "ba/b",
-                "--extract-audio",
-                "--audio-format", fmt,
-                "--audio-quality", q_arg,
-                "--add-metadata",
-                "--embed-thumbnail",
-                "--no-playlist",
-                "-o", output_template
-            ]
+            q = quality if quality in {"96", "128", "160", "192", "256", "320"} else "192"
+            cmd.extend(["-f", "bestaudio/best", "-x", "--audio-format", fmt,
+                        "--audio-quality", f"{q}K"])
 
-        success = False
-        last_error_lines = []
+        cmd.extend(["--", url])
+        logger.info("job=%s starting platform=%s format=%s quality=%s deno=%s ffmpeg=%s cookies=%s",
+                    job_id, urlparse(url).hostname, fmt, quality,
+                    bool(shutil.which("deno")), bool(ffmpeg), bool(found_cookie))
 
-        for strat_idx, strat in enumerate(strategies):
-            strat_args = strat["args"]
-            use_cookies = strat["use_cookies"]
-            strat_name = strat["name"]
-
-            cmd = [
-                sys.executable, "-m", "yt_dlp",
-                "-4",
-                "--no-check-certificates",
-                "--geo-bypass",
-                "--socket-timeout", "30",
-            ]
-
-            if found_cookie and use_cookies:
-                cmd.extend(["--cookies", str(found_cookie.resolve())])
-
-            if strat_args:
-                cmd.extend(strat_args)
-
-            po_token = os.environ.get("YT_PO_TOKEN") or os.environ.get("PO_TOKEN")
-            if po_token and is_youtube:
-                cmd.extend(["--extractor-args", f"youtube:po_token=web+{po_token}"])
-
-            if is_instagram:
-                cmd.extend([
-                    "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                    "--add-header", "Accept-Language: en-US,en;q=0.9"
-                ])
-
-            cmd.extend(format_args)
-
-            if ffmpeg_dir and os.path.exists(ffmpeg_dir):
-                cmd.extend(["--ffmpeg-location", ffmpeg_dir])
-
-            # Security: Use '--' to separate options from URL, preventing argument injection
-            cmd.extend(["--", url])
-
-            error_lines = []
-
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    universal_newlines=True
-                )
-
-                for line in proc.stdout:
-                    clean = line.strip()
-                    if not clean:
-                        continue
-
-                    if "ERROR:" in clean or "Sign in to confirm" in clean or "429" in clean or "blocked" in clean.lower():
-                        error_lines.append(clean)
-
-                    if "[download]" in clean and "%" in clean:
-                        match = re.search(r'(\d+(?:\.\d+)?)%', clean)
-                        if match:
-                            pct = float(match.group(1))
-                            mapped = 10 + int(pct * 0.75)
+        tail = deque(maxlen=35)
+        timed_out = False
+        try:
+            with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, bufsize=1, errors="replace", start_new_session=True) as proc:
+                import signal
+                # Kill runaway yt-dlp/ffmpeg process groups even if the server stays alive.
+                timeout_hit = threading.Event()
+                def kill_overdue():
+                    if proc.poll() is None:
+                        timeout_hit.set()
+                        os.killpg(proc.pid, signal.SIGKILL)
+                timer = threading.Timer(720, kill_overdue)
+                timer.daemon = True
+                timer.start()
+                try:
+                    for line in proc.stdout:
+                        clean = line.strip()
+                        if not clean:
+                            continue
+                        tail.append(clean)
+                        if "ERROR:" in clean or "WARNING:" in clean or "[youtube]" in clean:
+                            logger.warning("job=%s %s", job_id, clean[:800])
+                        if "[download]" in clean and "%" in clean:
+                            match = re.search(r"(\d+(?:\.\d+)?)%", clean)
+                            if match:
+                                with _jobs_lock:
+                                    jobs[job_id].update(progress=min(85, 10 + int(float(match.group(1)) * .75)),
+                                                        message="Downloading media...")
+                        elif "[ExtractAudio]" in clean or "[Merger]" in clean or "[ffmpeg]" in clean:
                             with _jobs_lock:
-                                if job_id in jobs:
-                                    jobs[job_id]["progress"] = mapped
-                                    jobs[job_id]["message"] = f"Downloading stream ({int(pct)}%)..."
-                    elif "[ExtractAudio]" in clean or "[ffmpeg]" in clean or "[Merger]" in clean:
-                        with _jobs_lock:
-                            if job_id in jobs:
-                                jobs[job_id]["progress"] = 92
-                                jobs[job_id]["message"] = f"Encoding {fmt.upper()}..."
+                                jobs[job_id].update(progress=92, message="Converting media...")
+                    code = proc.wait()
+                finally:
+                    timed_out = timeout_hit.is_set()
+                    timer.cancel()
+        except Exception:
+            logger.exception("job=%s subprocess exception", job_id)
+            raise
 
-                proc.wait()
-
-                if proc.returncode == 0:
-                    target_ext = "mp4" if is_video else fmt
-                    produced_files = list(job_folder.glob(f"*.{target_ext}"))
-                    if not produced_files:
-                        produced_files = [f for f in job_folder.iterdir() if f.is_file() and not f.name.endswith(".part")]
-
-                    if produced_files:
-                        output_file = produced_files[0]
-                        file_size_bytes = os.path.getsize(output_file)
-                        with _jobs_lock:
-                            if job_id in jobs:
-                                jobs[job_id]["status"] = "completed"
-                                jobs[job_id]["progress"] = 100
-                                jobs[job_id]["message"] = "Ready to download!"
-                                jobs[job_id]["file_path"] = str(output_file)
-                                jobs[job_id]["file_name"] = output_file.name
-                                jobs[job_id]["file_size"] = file_size_bytes
-                        success = True
-                        break
-
-                last_error_lines = error_lines
-                if strat_idx < len(strategies) - 1:
-                    next_strat = strategies[strat_idx + 1]["name"]
-                    with _jobs_lock:
-                        if job_id in jobs:
-                            jobs[job_id]["message"] = f"Switching client to {next_strat}..."
-                    time.sleep(0.5)
-                    continue
-
-            except Exception as e:
-                last_error_lines = [str(e)]
-
-        if not success:
+        if code != 0:
+            detail = " | ".join(tail)[-1800:]
+            logger.error("job=%s yt-dlp exit=%s timed_out=%s output=%s", job_id, code, timed_out, detail)
+            lower = detail.lower()
+            cookie_badge = f" [Cookies: {found_cookie.name}]" if found_cookie else " [Cookies: none detected]"
+            if "confirm you're not a bot" in lower or "sign in to confirm" in lower:
+                message = f"YouTube requested verification from this server{cookie_badge}. Ensure cookies are mounted in Render Secret Files."
+            elif "403" in lower or "forbidden" in lower:
+                message = f"Media server returned HTTP 403{cookie_badge}. The stream token was revoked or expired."
+            elif "requested format is not available" in lower:
+                message = "Selected format or quality is unavailable. Try another resolution."
+            elif timed_out:
+                message = "Conversion timed out on the server. Try a shorter video."
+            else:
+                message = f"Download failed{cookie_badge}. Check Render logs for the yt-dlp error."
             with _jobs_lock:
-                if job_id in jobs:
-                    jobs[job_id]["status"] = "error"
-                    if last_error_lines:
-                        clean_err = last_error_lines[-1].replace("ERROR: ", "").strip()
-                        norm_err = clean_err.lower()
+                jobs[job_id].update(status="error", message=message)
+            return
 
-                        if "sign in to confirm" in norm_err or "confirm you're not a bot" in norm_err:
-                            jobs[job_id]["message"] = "YouTube bot check triggered. Please try again in a few moments or refresh session."
-                        elif "403" in norm_err or "forbidden" in norm_err:
-                            jobs[job_id]["message"] = "YouTube returned 403 Forbidden. The stream token was revoked or expired."
-                        elif "requested format is not available" in norm_err:
-                            jobs[job_id]["message"] = "The requested quality or format is unavailable for this video."
-                        elif "private video" in norm_err or "video unavailable" in norm_err:
-                            jobs[job_id]["message"] = "This video is private, restricted, or no longer available."
-                        else:
-                            jobs[job_id]["message"] = f"Extraction failed: {clean_err[:120]}"
-                    else:
-                        jobs[job_id]["message"] = "Extraction failed. The link may be unavailable or blocked."
-
+        files = [f for f in folder.iterdir() if f.is_file() and
+                 f.suffix.lower() == f".{fmt}" and f.stat().st_size > 0]
+        if not files:
+            logger.error("job=%s yt-dlp completed but expected .%s output was not produced", job_id, fmt)
+            with _jobs_lock:
+                jobs[job_id].update(status="error", message="Conversion completed but output format was not produced. Check FFmpeg logs.")
+            return
+        result = max(files, key=lambda f: f.stat().st_size)
+        with _jobs_lock:
+            jobs[job_id].update(status="completed", progress=100, message="Ready to download!",
+                                file_path=str(result), file_name=result.name,
+                                file_size=result.stat().st_size)
+        logger.info("job=%s success bytes=%s", job_id, result.stat().st_size)
+    except Exception:
+        logger.exception("job=%s unexpected failure", job_id)
+        with _jobs_lock:
+            if job_id in jobs:
+                jobs[job_id].update(status="error", message="Unexpected backend error. See Render logs.")
     finally:
         with _jobs_lock:
             _active_jobs_count = max(0, _active_jobs_count - 1)
@@ -618,6 +513,11 @@ async def download_file(job_id: str):
     )
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "sonicflow"}
+
+
 @app.get("/api/diagnostics")
 def get_diagnostics(token: Optional[str] = Query(None), x_admin_token: Optional[str] = Header(None)):
     """
@@ -630,14 +530,14 @@ def get_diagnostics(token: Optional[str] = Query(None), x_admin_token: Optional[
     is_authenticated_admin = bool(admin_secret and caller_token and caller_token == admin_secret)
 
     ffmpeg_bin = find_ffmpeg()
-    node_bin = shutil.which("node") or shutil.which("nodejs")
+    node_bin = shutil.which("deno")
     found_cookie, cookie_info = find_cookie_file()
     is_auth, _ = check_cookie_auth(found_cookie) if found_cookie else (False, "none")
 
     summary = {
         "status": "online",
         "service": "SonicFlow",
-        "version": "v1.3.0",
+        "version": "v1.3.1",
         "ffmpeg_ready": bool(ffmpeg_bin and (os.path.exists(ffmpeg_bin) or shutil.which(ffmpeg_bin))),
         "engine_ready": bool(node_bin),
         "auth_ready": is_auth,
@@ -657,7 +557,7 @@ def get_diagnostics(token: Optional[str] = Query(None), x_admin_token: Optional[
             "cookie_source": cookie_info,
             "cookie_file_size_bytes": found_cookie.stat().st_size if found_cookie and found_cookie.exists() else 0,
             "ffmpeg_path": ffmpeg_bin,
-            "nodejs_path": node_bin,
+            "deno_path": node_bin,
             "secrets_files": secrets_list,
         })
 
